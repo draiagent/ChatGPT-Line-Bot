@@ -7,10 +7,12 @@ from linebot.exceptions import (
     InvalidSignatureError
 )
 from linebot.models import (
-    MessageEvent, TextMessage, TextSendMessage, ImageSendMessage, AudioMessage
+    MessageEvent, TextMessage, TextSendMessage, ImageSendMessage, ImageMessage, AudioMessage
 )
 import os
 import uuid
+import base64
+import imghdr
 
 from src.models import OpenAIModel
 from src.memory import Memory
@@ -69,7 +71,7 @@ def handle_text_message(event):
             msg = TextSendMessage(text='Token 有效，註冊成功')
 
         elif text.startswith('/指令說明'):
-            msg = TextSendMessage(text="指令：\n/註冊 + API Token\n👉 API Token 請先到 https://platform.openai.com/ 註冊登入後取得\n\n/系統訊息 + Prompt\n👉 Prompt 可以命令機器人扮演某個角色，例如：請你扮演擅長做總結的人\n\n/清除\n👉 當前每一次都會紀錄最後兩筆歷史紀錄，這個指令能夠清除歷史訊息\n\n/圖像 + Prompt\n👉 會調用 DALL∙E 2 Model，以文字生成圖像\n\n語音輸入\n👉 會調用 Whisper 模型，先將語音轉換成文字，再調用 ChatGPT 以文字回覆\n\n其他文字輸入\n👉 調用 ChatGPT 以文字回覆")
+            msg = TextSendMessage(text="指令：\n/註冊 + API Token\n👉 API Token 請先到 https://platform.openai.com/ 註冊登入後取得\n\n/系統訊息 + Prompt\n👉 Prompt 可以命令機器人扮演某個角色，例如：請你扮演擅長做總結的人\n\n/清除\n👉 當前每一次都會紀錄最後兩筆歷史紀錄，這個指令能夠清除歷史訊息\n\n/圖像 + Prompt\n👉 會調用 DALL∙E 2 Model，以文字生成圖像\n\n圖片輸入\n👉 會辨識食物並估計 GI 值\n\n語音輸入\n👉 會調用 Whisper 模型，先將語音轉換成文字，再調用 ChatGPT 以文字回覆\n\n其他文字輸入\n👉 調用 ChatGPT 以文字回覆")
 
         elif text.startswith('/系統訊息'):
             memory.change_system_message(user_id, text[5:].strip())
@@ -173,6 +175,63 @@ def handle_audio_message(event):
         else:
             msg = TextSendMessage(text=str(e))
     os.remove(input_audio_path)
+    line_bot_api.reply_message(event.reply_token, msg)
+
+
+@handler.add(MessageEvent, message=ImageMessage)
+def handle_image_message(event):
+    user_id = event.source.user_id
+    image_content = line_bot_api.get_message_content(event.message.id)
+    input_image_path = f'{str(uuid.uuid4())}.jpg'
+    with open(input_image_path, 'wb') as fd:
+        for chunk in image_content.iter_content():
+            fd.write(chunk)
+
+    try:
+        if not model_management.get(user_id):
+            raise ValueError('Invalid API token')
+
+        with open(input_image_path, 'rb') as fd:
+            image_bytes = fd.read()
+        image_type = imghdr.what(None, image_bytes) or 'jpeg'
+        image_b64 = base64.b64encode(image_bytes).decode('utf-8')
+        data_url = f'data:image/{image_type};base64,{image_b64}'
+        prompt = (
+            '請辨識圖片中的食物，估計每項食物的 GI 值或 GI 範圍。'
+            '若無法辨識食物，請說明原因並請我提供更清晰的照片。'
+            '請提醒 GI 為估算值，並可簡短說明影響 GI 的可能因素。'
+        )
+        system_message = memory.system_messages.get(user_id) or memory.default_system_message
+        messages = memory.get(user_id) or [{'role': 'system', 'content': system_message}]
+        messages = messages + [{
+            'role': 'user',
+            'content': [
+                {'type': 'text', 'text': prompt},
+                {'type': 'image_url', 'image_url': {'url': data_url}}
+            ]
+        }]
+        is_successful, response, error_message = model_management[user_id].chat_completions(
+            messages,
+            os.getenv('OPENAI_MODEL_ENGINE')
+        )
+        if not is_successful:
+            raise Exception(error_message)
+        role, response = get_role_and_content(response)
+        memory.append(user_id, 'user', '[使用者上傳圖片]')
+        memory.append(user_id, role, response)
+        msg = TextSendMessage(text=response)
+    except ValueError:
+        msg = TextSendMessage(text='請先註冊你的 API Token，格式為 /註冊 [API TOKEN]')
+    except KeyError:
+        msg = TextSendMessage(text='請先註冊 Token，格式為 /註冊 sk-xxxxx')
+    except Exception as e:
+        memory.remove(user_id)
+        if str(e).startswith('Incorrect API key provided'):
+            msg = TextSendMessage(text='OpenAI API Token 有誤，請重新註冊。')
+        else:
+            msg = TextSendMessage(text=str(e))
+    finally:
+        os.remove(input_image_path)
     line_bot_api.reply_message(event.reply_token, msg)
 
 
